@@ -85,6 +85,6 @@ MIT License
 
 ## Author
 
-Developed by \[your name or organization], 2025.
+Developed by ghildebrand, 2025.
 
 Pull requests welcome!
