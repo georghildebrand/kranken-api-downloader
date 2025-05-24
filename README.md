@@ -1,22 +1,90 @@
-# kranken-api-downloader
+# Kraken Pipeline
 
-simple scripts to download from kranke api and compress the output into a parquet
+This project provides a modular, command-line pipeline for downloading, processing, and archiving historical OHLC (Open-High-Low-Close) market data from the [Kraken](https://www.kraken.com/) cryptocurrency exchange.
 
-python csv_to_parquet.py -i test-data/ -o parquet-data/
+The pipeline supports:
 
-###
-kraken_pipeline.py
-├─ 1. Check if ./<yyyy>/<mm> exists
-|- 2. Download data into ./<yyyy>/<mm>/<yyyy-mm-dd-HH-MM>-<pair>.csv
-├─ 2. Move all new .csv into ./<year>/<month>/
-├─ 3. For each unprocessed .csv:
-│    ├─ Append to parquet-data/<year>/<month>.parquet (gzip)
-│    └─ Rename .csv → .csv.copied
-     |_ Optional --delete-csv to delete copied files
-└─ 4. Done ✅
+* Scheduled downloads of OHLC data in CSV format
+* Efficient appending to Parquet files, organized by year/month
+* Optional deletion of processed CSVs
+* Migration of existing CSV archives
+* Restore functionality for previously archived files
+* Selective pair downloads and customizable logging
 
-Optional: restore copied files with -i <input path> --restore
+---
 
-Optional: python csv_to_parquet.py -i test-data/ -o parquet-data/  migrates existing archive into yyyy/mm/parquet
+## Requirements
 
-tries to be as memory savy as possible. especially when appending an existing parquet file its not blowing up the memory
+* Python 3.7+
+* `pandas`, `requests`, `pyarrow`
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Usage
+
+```bash
+python kraken-pipeline.py -i <input_folder> -o <output_folder> [options]
+```
+
+### Arguments
+
+| Flag           | Description                                                            |
+| -------------- | ---------------------------------------------------------------------- |
+| `-i, --input`  | **Required.** Path to input folder where CSVs are stored or downloaded |
+| `-o, --output` | Folder where Parquet files will be stored (default: `parquet-data`)    |
+| `--download`   | Trigger fresh Kraken OHLC downloads                                    |
+| `--migrate`    | Migrate existing CSV archive into Parquet format                       |
+| `--delete-csv` | Delete `.csv.copied` files after successful conversion                 |
+| `--restore`    | Restore `.csv.copied` files back to `.csv`                             |
+| `--pairs`      | Optional. List of Kraken trading pairs to download (e.g. `XETHZEUR`)   |
+| `--log-level`  | Set logging verbosity: DEBUG, INFO, WARNING, ERROR (default: INFO)     |
+
+### Example
+
+```bash
+python kraken-pipeline.py \
+  -i ./data \
+  -o ./parquet \
+  --download \
+  --migrate \
+  --delete-csv \
+  --pairs XETHZEUR XXBTZUSD \
+  --log-level DEBUG
+```
+
+---
+
+## File Behavior
+
+* Downloads are saved as: `YYYY/MM/YYYY-MM-DD-HH-MM-<PAIR>.csv`
+* Processed CSVs are renamed: `*.csv` -> `*.csv.copied`
+* Parquet files are written to: `<output>/<year>/<month>/<year>-<month>.parquet`
+* Logs are appended to: `<input>/pipeline.log`
+
+---
+
+## Tips
+
+* Add to `cron` for scheduled downloads (e.g., every 12 hours)
+* Use `--migrate` once on existing folders
+* Use `--restore` if you want to reprocess `.csv.copied`
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+Developed by \[your name or organization], 2025.
+
+Pull requests welcome!
