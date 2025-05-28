@@ -138,31 +138,34 @@ def restore_copied(input_path, logger):
     logger.info("Restored %d files.", count)
 
 
-def migrate_existing(input_path, output_path, logger, delete_csv=False):
+def migrate_existing(input_path, output_path, logger, delete_csv=False, mark_errors=False):
     all_csvs = list(input_path.rglob("*.csv"))
     logger.debug("Found %d CSV files to migrate", len(all_csvs))
     for csv_file in all_csvs:
         parts = csv_file.parts
         try:
-            year = parts[-3]  # 2025
-            month = parts[-2]  # 01
-            #logger.debug("Year: %s Month: %s", year, month)
+            year = parts[-3]  # e.g., 2025
+            month = parts[-2]  # e.g., 01
         except IndexError:
             logger.error("Path structure too short: %s", csv_file)
             continue
-        except StopIteration:
-            logger.error("Stop Iteration when trying to parse year and month from file!")
-            continue
+
         parquet_file = output_path / year / month / f"{year}-{month}.parquet"
         ensure_dir(parquet_file.parent)
+
         try:
             logger.debug("Reading for migration: %s", csv_file)
+            if csv_file.stat().st_size == 0:
+                raise pd.errors.EmptyDataError("File is empty")
+
             df = pd.read_csv(csv_file, low_memory=True)
+
             if parquet_file.exists():
                 df_old = pd.read_parquet(parquet_file)
                 df_combined = pd.concat([df_old, df], ignore_index=True)
             else:
                 df_combined = df
+
             logger.debug("Writing migrated Parquet: %s", parquet_file)
             df_combined.to_parquet(parquet_file, index=False, compression="gzip")
 
@@ -173,8 +176,19 @@ def migrate_existing(input_path, output_path, logger, delete_csv=False):
             if delete_csv:
                 logger.debug("Deleting copied CSV file: %s", copied)
                 copied.unlink()
+
+        except pd.errors.EmptyDataError as e:
+            logger.warning("Empty CSV skipped: %s", csv_file)
+            if mark_errors:
+                error_file = csv_file.with_suffix(csv_file.suffix + ".error")
+                csv_file.rename(error_file)
+                logger.error("Marked file as error: %s", error_file)
         except Exception as e:
-            logger.error("Failed to migrate %s: %s", csv_file, str(e))
+            logger.error("Failed to migrate %s: %s", csv_file, e)
+            if mark_errors:
+                error_file = csv_file.with_suffix(csv_file.suffix + ".error")
+                csv_file.rename(error_file)
+                logger.error("Marked file as error: %s", error_file)
 
 
 def main():
@@ -187,6 +201,7 @@ def main():
     parser.add_argument("--download", action="store_true", help="Download new Kraken data before processing")
     parser.add_argument("--pairs", nargs='+', help="List of asset pairs to download (e.g., XETHZEUR XXBTZUSD)")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL")
+    parser.add_argument("--mark-errors", action="store_true", help="Rename failed .csv files to .error instead of .copied")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -199,7 +214,7 @@ def main():
         download_data(input_path, logger, selected_pairs=args.pairs)
 
     if args.migrate:
-        migrate_existing(input_path, output_path, logger, delete_csv=args.delete_csv)
+        migrate_existing(input_path, output_path, logger, delete_csv=args.delete_csv, mark_errors=args.mark_errors)
 
     if args.restore:
         restore_copied(input_path, logger)
