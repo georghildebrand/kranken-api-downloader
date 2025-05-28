@@ -74,6 +74,7 @@ python kraken-pipeline.py \
 * Add to `cron` for scheduled downloads (e.g., every 12 hours)
 * Use `--migrate` once on existing folders
 * Use `--restore` if you want to reprocess `.csv.copied`
+* Use `--mark-errors` if you want corrupted csv files to be marked as `.csv.error`
 
 ---
 
