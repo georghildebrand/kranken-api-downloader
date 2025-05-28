@@ -1,2 +1,5 @@
 .copied
 .parquet
+venv/
+pipeline.log
+*.ipynb
