@@ -224,6 +224,8 @@ def main():
 
     input_path = Path(args.input)
     output_path = Path(args.output)
+    # create logging file and folder
+    input_path.mkdir(parents=True, exist_ok=True)
     log_file = input_path / "pipeline.log"
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logger = setup_logging(log_file, log_level)
