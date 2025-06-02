@@ -1,36 +1,34 @@
-import csv
-import os
-import sys
 import argparse
 import datetime as dt
-import requests as r
-import pandas as pd
-from pathlib import Path
-import re
-import traceback
 import logging
+import os
+import sys
+import traceback
+from pathlib import Path
+import pandas as pd
+import requests as r
 
-# Constants
 PAIRS_URL = 'https://api.kraken.com/0/public/AssetPairs'
 TIME_URL = 'https://api.kraken.com/0/public/Time'
 OHLC_URL = 'https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1&since={since}'
 
 
-def setup_logging(log_file, log_level):
+def setup_logging(log_file, level):
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("kraken_pipeline")
-    logger.setLevel(log_level)
+    logger.setLevel(level)
 
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(log_level)
-    logger.addHandler(file_handler)
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    fh.setLevel(level)
+    logger.addHandler(fh)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(log_level)
-    logger.addHandler(console_handler)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    ch.setLevel(level)
+    logger.addHandler(ch)
 
     return logger
 
@@ -39,208 +37,209 @@ def ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def is_valid_parquet(file_path, logger=None):
+def is_valid_parquet(path):
     try:
-        pd.read_parquet(file_path, engine='pyarrow')
+        pd.read_parquet(path)
         return True
     except Exception as e:
-        if logger:
-            logger.warning("Parquet validation failed for %s: %s", file_path, e)
         return False
 
 
-def download_data(base_path, logger, selected_pairs=None):
+def restore_copied_files(logger, input_path):
+    restored = 0
+    for file in input_path.rglob("*.csv.copied"):
+        original = file.with_suffix("")
+        file.rename(original)
+        logger.info(f"Restored: {file} -> {original}")
+        restored += 1
+    logger.info(f"🔁 Restored {restored} .copied files.")
+
+
+def restore_error_files(logger, input_path):
+    restored = 0
+    for file in input_path.rglob("*.csv.error"):
+        original = file.with_suffix("")
+        file.rename(original)
+        logger.info(f"Restored: {file} -> {original}")
+        restored += 1
+    logger.info(f"🔁 Restored {restored} .error files.")
+
+
+def download_recent_data(logger, output_path, pairs=None, keep_csv=True):
     try:
-        logger.debug("Fetching Kraken server time...")
-        resp = r.get(TIME_URL).json()
-        server_now = resp['result']['unixtime']
-        start = server_now - 12 * 60 * 60
-        logger.debug(f"Server time: {server_now}, Start time: {start}")
+        server_time = r.get(TIME_URL).json()['result']['unixtime']
+        since = server_time - 12 * 60 * 60
+        logger.info(f"Kraken server time: {server_time}, fetching since: {since}")
     except Exception as e:
-        logger.error("Error fetching server time: %s", str(e))
+        logger.error("Error fetching Kraken time: %s", e)
         return
 
     try:
-        logger.debug("Fetching available asset pairs from Kraken...")
-        pairs = r.get(PAIRS_URL).json()['result'].keys()
-        if selected_pairs:
-            logger.debug("Filtering for selected pairs only: %s", selected_pairs)
-            pairs = [p for p in pairs if p in selected_pairs]
-        logger.info("Downloading data for %d pairs", len(pairs))
+        all_pairs = r.get(PAIRS_URL).json()['result'].keys()
+        if pairs:
+            all_pairs = [p for p in all_pairs if p in pairs]
+        logger.info(f"Fetching data for {len(all_pairs)} pairs")
     except Exception as e:
-        logger.error("Error fetching asset pairs: %s", str(e))
+        logger.error("Error fetching Kraken pairs: %s", e)
         return
 
-    today = dt.datetime.now()
-    year = today.strftime('%Y')
-    month = today.strftime('%m')
-    folder = base_path / year / month
-    ensure_dir(folder)
+    today = dt.datetime.utcnow()
+    year, month = today.strftime('%Y'), today.strftime('%m')
+    target_file = output_path / year / month / f"{year}-{month}.parquet"
+    ensure_dir(target_file.parent)
 
-    for pair in pairs:
+    all_data = []
+
+    for pair in all_pairs:
         try:
-            logger.debug("Requesting OHLC data for pair: %s", pair)
-            resp = r.get(OHLC_URL.format(pair=pair, since=start)).json()
-            result = resp['result'].get(pair)
-            if not result:
-                logger.debug("No data returned for %s", pair)
-                continue
-
-            filename = today.strftime('%Y-%m-%d-%H-%M') + f'-{pair}.csv'
-            file_path = folder / filename
-
-            logger.debug("Writing data to file: %s", file_path)
-            with open(file_path, 'w') as f:
-                f.write("time,open,high,low,close,vwap,volume,count,pair\n")
-                for row in result:
-                    row[0] = dt.datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M')
-                    row.append(pair)
-                    f.write(",".join(map(str, row)) + "\n")
+            logger.debug(f"Downloading OHLC data for {pair}")
+            url = OHLC_URL.format(pair=pair, since=since)
+            resp = r.get(url).json()['result'].get(pair, [])
+            for row in resp:
+                all_data.append([
+                    dt.datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M'),
+                    *row[1:8],
+                    pair
+                ])
         except Exception as e:
-            logger.error("Failed to fetch/write data for %s: %s", pair, str(e))
+            logger.warning("Failed for %s: %s", pair, e)
 
+    if not all_data:
+        logger.warning("No data downloaded.")
+        return
 
-def process_csvs(input_path, parquet_path, delete_csv, logger):
-    all_csvs = list(input_path.rglob("*.csv"))
-    logger.debug("Found %d CSV files to process", len(all_csvs))
-    for csv_file in all_csvs:
-        if csv_file.name.endswith(".copied"):
-            continue
+    df = pd.DataFrame(all_data, columns=[
+        "time", "open", "high", "low", "close", "vwap", "volume", "count", "pair"
+    ])
 
+    if keep_csv:
+        csv_folder = output_path / year / month
+        ensure_dir(csv_folder)
+        for pair in df['pair'].unique():
+            pair_df = df[df['pair'] == pair].copy()
+            timestamp = today.replace(minute=0, second=0, microsecond=0).strftime('%Y-%m-%d-%H-%M')
+            csv_file = csv_folder / f"{timestamp}-{pair}.csv"
+            pair_df.to_csv(csv_file, index=False)
+            logger.info(f"📝 Saved CSV to {csv_file}")
+
+    if target_file.exists():
         try:
-            match = re.search(r"(\d{4})/(\d{2})", str(csv_file.parent))
-            if not match:
-                continue
-            year, month = match.group(1), match.group(2)
-            parquet_file = parquet_path / year / month / f"{year}-{month}.parquet"
-            ensure_dir(parquet_file.parent)
-
-            if csv_file.stat().st_size == 0:
-                logger.warning("Skipping empty file: %s", csv_file)
-                continue
-
-            logger.debug("Reading CSV file: %s", csv_file)
-            df_new = pd.read_csv(csv_file, low_memory=False)
-
-            if parquet_file.exists():
-                if not is_valid_parquet(parquet_file, logger):
-                    logger.warning("Deleting corrupted Parquet file: %s", parquet_file)
-                    parquet_file.unlink()
-                else:
-                    df_old = pd.read_parquet(parquet_file)
-                    df_new = pd.concat([df_old, df_new], ignore_index=True)
-
-            logger.debug("Writing combined DataFrame to Parquet: %s", parquet_file)
-            df_new.to_parquet(parquet_file, index=False, compression="gzip")
-
-            copied = csv_file.with_suffix(csv_file.suffix + ".copied")
-            logger.debug("Renaming CSV to: %s", copied)
-            csv_file.rename(copied)
-
-            if delete_csv:
-                logger.debug("Deleting copied CSV file: %s", copied)
-                copied.unlink()
-        except Exception as e:
-            logger.error("Error processing %s:\n%s", csv_file, traceback.format_exc())
-
-
-def restore_copied(input_path, logger):
-    count = 0
-    for f in input_path.rglob("*.csv.copied"):
-        original = f.with_suffix(".csv")
-        f.rename(original)
-        count += 1
-    logger.info("Restored %d files.", count)
-
-
-def migrate_existing(input_path, output_path, logger, delete_csv=False, mark_errors=False):
-    all_csvs = list(input_path.rglob("*.csv"))
-    logger.debug("Found %d CSV files to migrate", len(all_csvs))
-    for csv_file in all_csvs:
-        try:
-            year = csv_file.parents[1].name
-            month = csv_file.parents[0].name
-        except IndexError:
-            logger.error("Path structure too short: %s", csv_file)
-            continue
-
-        parquet_file = output_path / year / month / f"{year}-{month}.parquet"
-        ensure_dir(parquet_file.parent)
-
-        try:
-            if csv_file.stat().st_size == 0:
-                raise pd.errors.EmptyDataError("File is empty")
-
-            df = pd.read_csv(csv_file, low_memory=True)
-
-            if parquet_file.exists():
-                if not is_valid_parquet(parquet_file, logger):
-                    logger.warning("Deleting invalid Parquet file: %s", parquet_file)
-                    parquet_file.unlink()
-                    df_combined = df
-                else:
-                    df_old = pd.read_parquet(parquet_file)
-                    df_combined = pd.concat([df_old, df], ignore_index=True)
+            if is_valid_parquet(target_file):
+                old = pd.read_parquet(target_file)
+                df = pd.concat([old, df], ignore_index=True)
             else:
-                df_combined = df
+                raise ValueError("Invalid Parquet file")
+        except Exception as e:
+            logger.warning(f"Replacing invalid Parquet file: {target_file} due to error: {e}")
+            target_file.unlink()
 
-            logger.debug("Writing migrated Parquet: %s", parquet_file)
-            df_combined.to_parquet(parquet_file, index=False, compression="gzip")
+    df.drop_duplicates(subset=["time", "pair"], inplace=True)
+    df.to_parquet(target_file, index=False, compression="gzip")
+    logger.info(f"✅ Stored {len(df)} rows in {target_file}")
+
+
+def migrate_csv_archive(logger, input_path, output_path, mark_errors=False, delete_csv=False):
+    csvs = list(input_path.rglob("*.csv"))
+    logger.info(f"Found {len(csvs)} CSV files to migrate")
+    migrated, skipped, failed = 0, 0, 0
+
+
+    for csv_file in csvs:
+        try:
+            year, month = csv_file.parents[1].name, csv_file.parents[0].name
+            target_file = output_path / year / month / f"{year}-{month}.parquet"
+            ensure_dir(target_file.parent)
+
+            if csv_file.stat().st_size == 0:
+                raise pd.errors.EmptyDataError("Empty file")
+
+            try:
+                df = pd.read_csv(csv_file, low_memory=False)
+                if len(df.columns) == 1:
+                    raise ValueError(f"Likely delimiter issue in {csv_file.name}: found only one column: {df.columns[0]}")
+                # Custom logic
+                if 'countpair' in df.columns and 'count' not in df.columns and 'pair' not in df.columns:
+                    df[['count', 'pair']] = df['countpair'].astype(str).str.extract(r'(\d+)([A-Z0-9]+)')
+                    df.drop(columns=['countpair'], inplace=True)
+                expected_columns = {"time", "pair"}
+                missing_columns = expected_columns - set(df.columns)
+                if missing_columns:
+                    raise ValueError(f"Missing expected columns in {csv_file.name}: {missing_columns}. Found columns: {df.columns.tolist()}")
+            except (pd.errors.ParserError, UnicodeDecodeError) as e:
+                raise ValueError(f"Invalid CSV format: {e}")
+
+            if target_file.exists():
+                try:
+                    if is_valid_parquet(target_file):
+                        old = pd.read_parquet(target_file)
+                        df = pd.concat([old, df], ignore_index=True)
+                    else:
+                        raise ValueError("Invalid Parquet file")
+                except Exception as e:
+                    logger.warning(f"Deleting invalid Parquet file: {target_file} due to: {e}")
+                    target_file.unlink()
+
+            df.drop_duplicates(subset=["time", "pair"], inplace=True)
+            df.to_parquet(target_file, index=False, compression="gzip")
 
             copied = csv_file.with_suffix(csv_file.suffix + ".copied")
-            logger.debug("Renaming migrated CSV to: %s", copied)
             csv_file.rename(copied)
 
             if delete_csv:
-                logger.debug("Deleting copied CSV file: %s", copied)
                 copied.unlink()
 
-        except pd.errors.EmptyDataError:
-            logger.warning("Empty CSV skipped: %s", csv_file)
+            migrated += 1
+            logger.info(f"Migrated: {csv_file} → {target_file}")
+
+        except (pd.errors.EmptyDataError, ValueError) as ve:
+            logger.warning(f"File skipped: {csv_file} due to: {ve}")
+            skipped += 1
             if mark_errors:
-                error_file = csv_file.with_suffix(csv_file.suffix + ".error")
-                csv_file.rename(error_file)
-                logger.error("Marked file as error: %s", error_file)
+                csv_file.rename(csv_file.with_suffix(".error"))
         except Exception as e:
-            logger.error("Failed to migrate %s: %s", csv_file, e)
+            logger.error(f"Error migrating {csv_file}: {e}\n{traceback.format_exc()}")
+            failed += 1
             if mark_errors:
-                error_file = csv_file.with_suffix(csv_file.suffix + ".error")
-                csv_file.rename(error_file)
-                logger.error("Marked file as error: %s", error_file)
+                csv_file.rename(csv_file.with_suffix(".error"))
+
+    logger.info(f"📦 Migration summary: {migrated} migrated, {skipped} skipped, {failed} failed")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kraken CSV Downloader and Parquet Archiver")
-    parser.add_argument("--input", "-i", type=str, required=True, help="Input data root folder")
-    parser.add_argument("--output", "-o", type=str, default="parquet-data", help="Parquet output folder")
-    parser.add_argument("--restore", action="store_true", help="Restore .csv.copied files to .csv")
-    parser.add_argument("--migrate", action="store_true", help="Migrate all existing archive to parquet")
-    parser.add_argument("--delete-csv", action="store_true", help="Delete .csv.copied files after archiving")
-    parser.add_argument("--download", action="store_true", help="Download new Kraken data before processing")
-    parser.add_argument("--pairs", nargs='+', help="List of asset pairs to download (e.g., XETHZEUR XXBTZUSD)")
-    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL")
-    parser.add_argument("--mark-errors", action="store_true", help="Rename failed .csv files to .error instead of .copied")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", "-i", type=str, required=True)
+    parser.add_argument("--output", "-o", type=str, default="parquet")
+    parser.add_argument("--download", action="store_true")
+    parser.add_argument("--migrate", action="store_true")
+    parser.add_argument("--restore-copied", action="store_true")
+    parser.add_argument("--restore-errors", action="store_true")
+    parser.add_argument("--pairs", nargs='+', help="Asset pairs to include")
+    parser.add_argument("--mark-errors", action="store_true")
+    parser.add_argument("--delete-csv", action="store_true")
+    parser.add_argument("--keep-csv", action="store_true")
+    parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     input_path = Path(args.input)
     output_path = Path(args.output)
-    # create logging file and folder
     input_path.mkdir(parents=True, exist_ok=True)
     log_file = input_path / "pipeline.log"
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logger = setup_logging(log_file, log_level)
 
+    if args.restore_copied:
+        restore_copied_files(logger, input_path)
+
+    if args.restore_errors:
+        restore_error_files(logger, input_path)
+
     if args.download:
-        download_data(input_path, logger, selected_pairs=args.pairs)
+        download_recent_data(logger, output_path, args.pairs, keep_csv=args.keep_csv)
 
     if args.migrate:
-        migrate_existing(input_path, output_path, logger, delete_csv=args.delete_csv, mark_errors=args.mark_errors)
+        migrate_csv_archive(logger, input_path, output_path, mark_errors=args.mark_errors, delete_csv=args.delete_csv)
 
-    if args.restore:
-        restore_copied(input_path, logger)
-
-    process_csvs(input_path, output_path, args.delete_csv, logger)
-    logger.info("✅ All tasks done.")
+    logger.info("✅ Pipeline complete.")
 
 
 if __name__ == "__main__":
