@@ -39,6 +39,16 @@ def ensure_dir(path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def is_valid_parquet(file_path, logger=None):
+    try:
+        pd.read_parquet(file_path, engine='pyarrow')
+        return True
+    except Exception as e:
+        if logger:
+            logger.warning("Parquet validation failed for %s: %s", file_path, e)
+        return False
+
+
 def download_data(base_path, logger, selected_pairs=None):
     try:
         logger.debug("Fetching Kraken server time...")
@@ -56,7 +66,7 @@ def download_data(base_path, logger, selected_pairs=None):
         if selected_pairs:
             logger.debug("Filtering for selected pairs only: %s", selected_pairs)
             pairs = [p for p in pairs if p in selected_pairs]
-        logger.info("Downloading data for num pairs: %s", len(pairs))
+        logger.info("Downloading data for %d pairs", len(pairs))
     except Exception as e:
         logger.error("Error fetching asset pairs: %s", str(e))
         return
@@ -98,25 +108,30 @@ def process_csvs(input_path, parquet_path, delete_csv, logger):
             continue
 
         try:
-            match = re.search(r"(\\d{4})/(\\d{2})", str(csv_file.parent))
+            match = re.search(r"(\d{4})/(\d{2})", str(csv_file.parent))
             if not match:
                 continue
             year, month = match.group(1), match.group(2)
             parquet_file = parquet_path / year / month / f"{year}-{month}.parquet"
             ensure_dir(parquet_file.parent)
 
+            if csv_file.stat().st_size == 0:
+                logger.warning("Skipping empty file: %s", csv_file)
+                continue
+
             logger.debug("Reading CSV file: %s", csv_file)
             df_new = pd.read_csv(csv_file, low_memory=False)
 
             if parquet_file.exists():
-                logger.debug("Reading existing Parquet file: %s", parquet_file)
-                df_old = pd.read_parquet(parquet_file)
-                df_combined = pd.concat([df_old, df_new], ignore_index=True)
-            else:
-                df_combined = df_new
+                if not is_valid_parquet(parquet_file, logger):
+                    logger.warning("Deleting corrupted Parquet file: %s", parquet_file)
+                    parquet_file.unlink()
+                else:
+                    df_old = pd.read_parquet(parquet_file)
+                    df_new = pd.concat([df_old, df_new], ignore_index=True)
 
             logger.debug("Writing combined DataFrame to Parquet: %s", parquet_file)
-            df_combined.to_parquet(parquet_file, index=False, compression="gzip")
+            df_new.to_parquet(parquet_file, index=False, compression="gzip")
 
             copied = csv_file.with_suffix(csv_file.suffix + ".copied")
             logger.debug("Renaming CSV to: %s", copied)
@@ -142,10 +157,9 @@ def migrate_existing(input_path, output_path, logger, delete_csv=False, mark_err
     all_csvs = list(input_path.rglob("*.csv"))
     logger.debug("Found %d CSV files to migrate", len(all_csvs))
     for csv_file in all_csvs:
-        parts = csv_file.parts
         try:
-            year = parts[-3]  # e.g., 2025
-            month = parts[-2]  # e.g., 01
+            year = csv_file.parents[1].name
+            month = csv_file.parents[0].name
         except IndexError:
             logger.error("Path structure too short: %s", csv_file)
             continue
@@ -154,15 +168,19 @@ def migrate_existing(input_path, output_path, logger, delete_csv=False, mark_err
         ensure_dir(parquet_file.parent)
 
         try:
-            logger.debug("Reading for migration: %s", csv_file)
             if csv_file.stat().st_size == 0:
                 raise pd.errors.EmptyDataError("File is empty")
 
             df = pd.read_csv(csv_file, low_memory=True)
 
             if parquet_file.exists():
-                df_old = pd.read_parquet(parquet_file)
-                df_combined = pd.concat([df_old, df], ignore_index=True)
+                if not is_valid_parquet(parquet_file, logger):
+                    logger.warning("Deleting invalid Parquet file: %s", parquet_file)
+                    parquet_file.unlink()
+                    df_combined = df
+                else:
+                    df_old = pd.read_parquet(parquet_file)
+                    df_combined = pd.concat([df_old, df], ignore_index=True)
             else:
                 df_combined = df
 
@@ -177,7 +195,7 @@ def migrate_existing(input_path, output_path, logger, delete_csv=False, mark_err
                 logger.debug("Deleting copied CSV file: %s", copied)
                 copied.unlink()
 
-        except pd.errors.EmptyDataError as e:
+        except pd.errors.EmptyDataError:
             logger.warning("Empty CSV skipped: %s", csv_file)
             if mark_errors:
                 error_file = csv_file.with_suffix(csv_file.suffix + ".error")
