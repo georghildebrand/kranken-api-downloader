@@ -147,7 +147,10 @@ def process_csvs(input_path, parquet_path, delete_csv, logger):
 def restore_copied(input_path, logger):
     count = 0
     for f in input_path.rglob("*.csv.copied"):
-        original = f.with_suffix(".csv")
+        # Path.with_suffix() only replaces the last extension, so using it
+        # directly on "file.csv.copied" would result in "file.csv.csv".
+        # Instead remove the trailing ".copied" extension entirely.
+        original = f.with_suffix("")
         f.rename(original)
         count += 1
     logger.info("Restored %d files.", count)
